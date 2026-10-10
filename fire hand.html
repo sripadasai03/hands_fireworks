@@ -1,0 +1,718 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Firecracker Draw</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { background:#000; width:100vw; height:100vh; overflow:hidden; cursor:none; }
+
+  #video {
+    position:fixed; inset:0;
+    width:100vw; height:100vh;
+    object-fit:cover;
+    transform:scaleX(-1);
+    opacity:0;
+    pointer-events:none;
+    z-index:-1;
+  }
+
+  #drawCanvas {
+    position:fixed; inset:0;
+    width:100vw; height:100vh;
+    z-index:1;
+  }
+
+  #handCanvas {
+    position:fixed; inset:0;
+    width:100vw; height:100vh;
+    pointer-events:none;
+    z-index:2;
+  }
+
+  #status {
+    position:fixed; top:22px; left:50%;
+    transform:translateX(-50%);
+    font-family:'Courier New', monospace;
+    font-size:.55rem; letter-spacing:6px;
+    color:rgba(255,200,50,.7);
+    pointer-events:none;
+    transition:opacity 1.2s;
+    white-space:nowrap;
+    z-index:10;
+    text-shadow: 0 0 18px rgba(255,160,0,1);
+  }
+
+  #hint {
+    position:fixed; bottom:24px; left:50%;
+    transform:translateX(-50%);
+    font-family:'Courier New', monospace;
+    font-size:.46rem; letter-spacing:4px;
+    color:rgba(255,120,0,.32);
+    pointer-events:none;
+    text-align:center;
+    z-index:10;
+  }
+
+  #gestureIndicator {
+    position:fixed; top:22px; left:22px;
+    font-family:'Courier New', monospace;
+    font-size:.48rem; letter-spacing:3px;
+    color:rgba(255,200,50,.5);
+    z-index:10;
+    pointer-events:none;
+    text-shadow: 0 0 10px rgba(255,160,0,.6);
+  }
+
+  #clearBtn {
+    position:fixed; top:16px; right:22px;
+    font-family:'Courier New', monospace;
+    font-size:.48rem; letter-spacing:3px;
+    color:rgba(255,120,0,.4);
+    border:1px solid rgba(255,100,0,.2);
+    background:transparent;
+    padding:6px 14px;
+    cursor:pointer;
+    z-index:10;
+    transition:all .3s;
+  }
+  #clearBtn:hover { color:rgba(255,200,50,.9); border-color:rgba(255,180,0,.5); box-shadow:0 0 12px rgba(255,120,0,.3); }
+</style>
+</head>
+<body>
+
+<video id="video" autoplay muted playsinline></video>
+<canvas id="drawCanvas"></canvas>
+<canvas id="handCanvas"></canvas>
+
+<div id="status">INITIALIZING...</div>
+<div id="gestureIndicator">—</div>
+<div id="hint">☝ INDEX FINGER UP = DRAW &nbsp;·&nbsp; LOWER FINGER = LAUNCH FIRECRACKER</div>
+<button id="clearBtn" onclick="clearAll()">CLEAR</button>
+
+<script src="https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.min.js"></script>
+<script type="module">
+import { FilesetResolver, HandLandmarker }
+  from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/vision_bundle.mjs";
+
+// ── Canvases ──────────────────────────────────────────────────────
+const video       = document.getElementById('video');
+const drawC       = document.getElementById('drawCanvas');
+const handC       = document.getElementById('handCanvas');
+const statusEl    = document.getElementById('status');
+const gestureEl   = document.getElementById('gestureIndicator');
+const dCtx        = drawC.getContext('2d');
+const hCtx        = handC.getContext('2d');
+
+function resize() {
+  drawC.width = handC.width = innerWidth;
+  drawC.height = handC.height = innerHeight;
+}
+resize();
+window.addEventListener('resize', resize);
+
+// ── State ─────────────────────────────────────────────────────────
+let strokes       = [];      // committed strokes [{pts:[{x,y}], done:bool}]
+let currentStroke = null;    // in-progress stroke pts
+let firecrackers  = [];      // active firecracker runners
+
+// ── Main render loop ──────────────────────────────────────────────
+let lastTime = 0;
+function loop(ts) {
+  requestAnimationFrame(loop);
+  const dt = Math.min((ts - lastTime) / 1000, 0.05);
+  lastTime = ts;
+
+  dCtx.clearRect(0, 0, drawC.width, drawC.height);
+
+  // Committed strokes — erase from the start as rocket travels over it
+  for (const s of strokes) {
+    if (s.burned >= 1) continue; // fully burned, skip
+    const start = Math.floor(s.pts.length * s.burned);
+    const visiblePts = s.pts.slice(start);
+    if (visiblePts.length < 2) continue;
+    drawStroke(dCtx, visiblePts, false, s.burned);
+  }
+
+  // In-progress stroke
+  if (currentStroke && currentStroke.length > 1)
+    drawStroke(dCtx, currentStroke, true, 0);
+
+  // Firecrackers
+  for (let i = firecrackers.length - 1; i >= 0; i--) {
+    firecrackers[i].update(dt);
+    firecrackers[i].draw(dCtx);
+    if (firecrackers[i].dead) {
+      // Stroke was already removed at explosion time; just clean up the firecracker
+      if (firecrackers[i].strokeRef) {
+        const idx = strokes.indexOf(firecrackers[i].strokeRef);
+        if (idx !== -1) strokes.splice(idx, 1);
+      }
+      firecrackers.splice(i, 1);
+    }
+  }
+}
+requestAnimationFrame(loop);
+
+// ── Draw a stroke ─────────────────────────────────────────────────
+function drawStroke(ctx, pts, active, burnedFraction) {
+  if (pts.length < 2) return;
+  ctx.save();
+  ctx.lineCap  = 'round';
+  ctx.lineJoin = 'round';
+
+  if (active) {
+    // Live drawing — golden glow
+    ctx.shadowBlur  = 22;
+    ctx.shadowColor = 'rgba(255,220,80,0.9)';
+    ctx.strokeStyle = 'rgba(255,230,100,0.95)';
+    ctx.lineWidth   = 2.5;
+  } else {
+    // Committed — dim white
+    ctx.shadowBlur  = 8;
+    ctx.shadowColor = 'rgba(255,255,255,0.3)';
+    ctx.strokeStyle = 'rgba(200,200,200,0.55)';
+    ctx.lineWidth   = 1.6;
+  }
+
+  ctx.beginPath();
+  ctx.moveTo(pts[0].x, pts[0].y);
+  for (let i = 1; i < pts.length; i++) {
+    const mx = (pts[i-1].x + pts[i].x) * 0.5;
+    const my = (pts[i-1].y + pts[i].y) * 0.5;
+    ctx.quadraticCurveTo(pts[i-1].x, pts[i-1].y, mx, my);
+  }
+  ctx.lineTo(pts[pts.length-1].x, pts[pts.length-1].y);
+  ctx.stroke();
+
+  ctx.restore();
+}
+
+// ── Clear ─────────────────────────────────────────────────────────
+window.clearAll = function() {
+  strokes = []; currentStroke = null; firecrackers = [];
+};
+
+// ── Arc-length helpers ────────────────────────────────────────────
+function buildArcs(pts) {
+  const arcs = [0];
+  for (let i = 1; i < pts.length; i++) {
+    const dx = pts[i].x - pts[i-1].x, dy = pts[i].y - pts[i-1].y;
+    arcs.push(arcs[i-1] + Math.hypot(dx, dy));
+  }
+  return arcs;
+}
+
+function posAtDist(pts, arcs, d) {
+  if (d <= 0) return { ...pts[0] };
+  const total = arcs[arcs.length-1];
+  if (d >= total) return { ...pts[pts.length-1] };
+  let lo = 0, hi = arcs.length - 1;
+  while (lo < hi - 1) {
+    const mid = (lo + hi) >> 1;
+    if (arcs[mid] <= d) lo = mid; else hi = mid;
+  }
+  const t = (d - arcs[lo]) / (arcs[hi] - arcs[lo]);
+  return {
+    x: pts[lo].x + t*(pts[hi].x - pts[lo].x),
+    y: pts[lo].y + t*(pts[hi].y - pts[lo].y),
+  };
+}
+
+// ── Firecracker ───────────────────────────────────────────────────
+class Firecracker {
+  constructor(pts) {
+    this.pts      = pts;
+    this.arcs     = buildArcs(pts);
+    this.totalLen = this.arcs[this.arcs.length - 1];
+    this.dist     = 0;
+    this.speed    = 380;       // px/s rocket travel
+    this.phase    = 'rocket';  // 'rocket' → 'explode' → 'dead'
+    this.dead     = false;
+    this.particles= [];
+    this.flashAlpha = 0;
+    this.burnedFraction = 0;
+    // Tail sparks
+    this.tailParticles = [];
+    // Find stroke reference to update burned
+    this.strokeRef = null;
+  }
+
+  update(dt) {
+    if (this.phase === 'rocket') {
+      this.dist = Math.min(this.dist + this.speed * dt, this.totalLen);
+      this.burnedFraction = this.dist / this.totalLen;
+      if (this.strokeRef) this.strokeRef.burned = this.burnedFraction;
+
+      const head = posAtDist(this.pts, this.arcs, this.dist);
+
+      // Tail smoke/spark trail
+      for (let i = 0; i < 4; i++) {
+        this.tailParticles.push(new TailSpark(head.x, head.y));
+      }
+      for (let i = this.tailParticles.length - 1; i >= 0; i--) {
+        this.tailParticles[i].update(dt);
+        if (this.tailParticles[i].dead) this.tailParticles.splice(i, 1);
+      }
+
+      if (this.dist >= this.totalLen) {
+        this.explode(head);
+      }
+    } else if (this.phase === 'explode') {
+      this.flashAlpha = Math.max(0, this.flashAlpha - dt * 3.5);
+      for (let i = this.particles.length - 1; i >= 0; i--) {
+        this.particles[i].update(dt);
+        if (this.particles[i].dead) this.particles.splice(i, 1);
+      }
+      for (let i = this.tailParticles.length - 1; i >= 0; i--) {
+        this.tailParticles[i].update(dt);
+        if (this.tailParticles[i].dead) this.tailParticles.splice(i, 1);
+      }
+      if (this.particles.length === 0 && this.flashAlpha <= 0) {
+        this.dead = true;
+      }
+    }
+  }
+
+  explode(pos) {
+    this.phase     = 'explode';
+    this.flashAlpha= 1;
+    this.explodePos= { ...pos };
+
+    // Burst of colored streaks + sparks
+    const COLORS = [
+      '#ff3300','#ff6600','#ffcc00','#ffff00',
+      '#ff00cc','#00ccff','#44ff88','#ff4466',
+      '#ffffff','#ffaa00',
+    ];
+    const COUNT = 120;
+    for (let i = 0; i < COUNT; i++) {
+      const angle  = (i / COUNT) * Math.PI * 2 + Math.random() * 0.2;
+      const speed  = 120 + Math.random() * 340;
+      const color  = COLORS[Math.floor(Math.random() * COLORS.length)];
+      const type   = Math.random();
+      if (type < 0.55) {
+        this.particles.push(new BurstStreak(pos.x, pos.y, angle, speed, color));
+      } else if (type < 0.80) {
+        this.particles.push(new StarParticle(pos.x, pos.y, angle, speed * 0.7, color));
+      } else {
+        this.particles.push(new GlitterParticle(pos.x, pos.y, angle, speed * 0.5, color));
+      }
+    }
+
+    // Secondary smaller pop
+    setTimeout(() => {
+      if (this.phase !== 'explode') return;
+      for (let i = 0; i < 40; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const speed = 60 + Math.random() * 120;
+        const color = COLORS[Math.floor(Math.random() * COLORS.length)];
+        this.particles.push(new GlitterParticle(pos.x, pos.y, angle, speed, color));
+      }
+    }, 120);
+  }
+
+  draw(ctx) {
+    // Draw tail sparks
+    for (const p of this.tailParticles) p.draw(ctx);
+
+    if (this.phase === 'rocket') {
+      const head = posAtDist(this.pts, this.arcs, this.dist);
+
+      // Rocket head glow
+      ctx.save();
+      const g = ctx.createRadialGradient(head.x, head.y, 0, head.x, head.y, 18);
+      g.addColorStop(0,   'rgba(255,255,200,1)');
+      g.addColorStop(0.3, 'rgba(255,160,20,0.9)');
+      g.addColorStop(1,   'rgba(255,60,0,0)');
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(head.x, head.y, 18, 0, Math.PI*2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    if (this.phase === 'explode') {
+      // Flash
+      if (this.flashAlpha > 0) {
+        ctx.save();
+        const ep = this.explodePos;
+        const r  = 200 * this.flashAlpha;
+        const g  = ctx.createRadialGradient(ep.x, ep.y, 0, ep.x, ep.y, r);
+        g.addColorStop(0,   `rgba(255,255,230,${this.flashAlpha * 0.95})`);
+        g.addColorStop(0.2, `rgba(255,180,50,${this.flashAlpha * 0.7})`);
+        g.addColorStop(1,   'rgba(255,50,0,0)');
+        ctx.fillStyle = g;
+        ctx.beginPath();
+        ctx.arc(ep.x, ep.y, r, 0, Math.PI*2);
+        ctx.fill();
+        ctx.restore();
+      }
+
+      // Particles
+      for (const p of this.particles) p.draw(ctx);
+    }
+  }
+}
+
+// ── Tail Spark ────────────────────────────────────────────────────
+class TailSpark {
+  constructor(x, y) {
+    this.x    = x + (Math.random()-0.5)*6;
+    this.y    = y + (Math.random()-0.5)*6;
+    this.vx   = (Math.random()-0.5)*40;
+    this.vy   = (Math.random()-0.5)*40;
+    this.life = 0.12 + Math.random()*0.18;
+    this.max  = this.life;
+    this.size = 1.5 + Math.random()*3;
+    this.dead = false;
+  }
+  update(dt) {
+    this.life -= dt;
+    if (this.life <= 0) { this.dead = true; return; }
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    this.size *= 0.93;
+  }
+  draw(ctx) {
+    const t = this.life/this.max;
+    ctx.save();
+    ctx.globalAlpha  = t*0.8;
+    ctx.shadowBlur   = 8;
+    ctx.shadowColor  = '#ff8800';
+    ctx.fillStyle    = t>0.5?'#ffcc44':'#ff6600';
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,this.size,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Burst Streak ─────────────────────────────────────────────────
+class BurstStreak {
+  constructor(x, y, angle, speed, color) {
+    this.x    = x; this.y = y;
+    this.vx   = Math.cos(angle)*speed;
+    this.vy   = Math.sin(angle)*speed;
+    this.life = 0.6 + Math.random()*0.7;
+    this.max  = this.life;
+    this.color= color;
+    this.len  = 8 + Math.random()*22;
+    this.dead = false;
+  }
+  update(dt) {
+    this.life -= dt;
+    if (this.life<=0){this.dead=true;return;}
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    this.vx *= 0.97; this.vy  = this.vy*0.97 + 60*dt;
+    this.len *= 0.97;
+  }
+  draw(ctx) {
+    const t = this.life/this.max;
+    ctx.save();
+    ctx.globalAlpha  = t*0.95;
+    ctx.strokeStyle  = this.color;
+    ctx.lineWidth    = 1.5 + t*2;
+    ctx.shadowBlur   = 14;
+    ctx.shadowColor  = this.color;
+    ctx.lineCap      = 'round';
+    const speed      = Math.hypot(this.vx, this.vy);
+    const nx         = this.vx/speed; const ny = this.vy/speed;
+    ctx.beginPath();
+    ctx.moveTo(this.x - nx*this.len, this.y - ny*this.len);
+    ctx.lineTo(this.x, this.y);
+    ctx.stroke();
+    ctx.restore();
+  }
+}
+
+// ── Star Particle ─────────────────────────────────────────────────
+class StarParticle {
+  constructor(x, y, angle, speed, color) {
+    this.x    = x; this.y = y;
+    this.vx   = Math.cos(angle)*speed;
+    this.vy   = Math.sin(angle)*speed;
+    this.life = 0.9 + Math.random()*0.8;
+    this.max  = this.life;
+    this.color= color;
+    this.size = 3 + Math.random()*5;
+    this.rot  = Math.random()*Math.PI*2;
+    this.rspd = (Math.random()-0.5)*8;
+    this.dead = false;
+    this.trail= [];
+  }
+  update(dt) {
+    this.life -= dt;
+    if (this.life<=0){this.dead=true;return;}
+    this.trail.push({x:this.x,y:this.y});
+    if (this.trail.length>8) this.trail.shift();
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    this.vy += 90*dt;
+    this.vx *= 0.985; this.vy *= 0.985;
+    this.rot += this.rspd*dt;
+    this.size *= 0.991;
+  }
+  draw(ctx) {
+    const t = this.life/this.max;
+    // Draw glowing trail
+    if (this.trail.length > 1) {
+      ctx.save();
+      ctx.strokeStyle = this.color;
+      ctx.lineWidth   = 1;
+      ctx.globalAlpha = t*0.35;
+      ctx.shadowBlur  = 6; ctx.shadowColor = this.color;
+      ctx.beginPath();
+      ctx.moveTo(this.trail[0].x, this.trail[0].y);
+      for (const p of this.trail) ctx.lineTo(p.x, p.y);
+      ctx.stroke();
+      ctx.restore();
+    }
+    // Draw star
+    ctx.save();
+    ctx.globalAlpha = t;
+    ctx.fillStyle   = this.color;
+    ctx.shadowBlur  = 12; ctx.shadowColor = this.color;
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.rot);
+    const s = this.size, pts = 5;
+    ctx.beginPath();
+    for (let i=0;i<pts*2;i++){
+      const r = i%2===0?s:s*0.45;
+      const a = (i/pts)*Math.PI - Math.PI/2;
+      i===0?ctx.moveTo(Math.cos(a)*r,Math.sin(a)*r):ctx.lineTo(Math.cos(a)*r,Math.sin(a)*r);
+    }
+    ctx.closePath(); ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Glitter Particle ──────────────────────────────────────────────
+class GlitterParticle {
+  constructor(x, y, angle, speed, color) {
+    this.x    = x+(Math.random()-0.5)*20;
+    this.y    = y+(Math.random()-0.5)*20;
+    this.vx   = Math.cos(angle)*speed;
+    this.vy   = Math.sin(angle)*speed;
+    this.life = 0.5+Math.random()*0.9;
+    this.max  = this.life;
+    this.color= color;
+    this.size = 1.5+Math.random()*3.5;
+    this.dead = false;
+    this.twinkle = Math.random()*Math.PI*2;
+  }
+  update(dt) {
+    this.life -= dt;
+    if (this.life<=0){this.dead=true;return;}
+    this.x += this.vx*dt; this.y += this.vy*dt;
+    this.vy += 50*dt;
+    this.vx *= 0.98;
+    this.twinkle += dt*12;
+  }
+  draw(ctx) {
+    const t  = this.life/this.max;
+    const tw = (Math.sin(this.twinkle)+1)*0.5;
+    ctx.save();
+    ctx.globalAlpha = t*tw*0.9;
+    ctx.fillStyle   = this.color;
+    ctx.shadowBlur  = 8+tw*10; ctx.shadowColor = this.color;
+    ctx.beginPath();
+    ctx.arc(this.x,this.y,this.size*tw,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ── Gesture detection ─────────────────────────────────────────────
+// Landmarks:
+//   4=thumb tip, 8=index tip, 12=middle tip, 16=ring tip, 20=pinky tip
+//   5=index MCP, 6=index PIP, 7=index DIP
+//   9=middle MCP, 13=ring MCP, 17=pinky MCP
+//   0=wrist
+
+function fingerExtended(lm, tipIdx, mcpIdx) {
+  // A finger is extended if tip is above (lower y) its MCP
+  return lm[tipIdx].y < lm[mcpIdx].y - 0.04;
+}
+
+function isIndexPointing(lm) {
+  const indexUp  = fingerExtended(lm, 8,  5);
+  const middleDown = !fingerExtended(lm, 12, 9);
+  const ringDown   = !fingerExtended(lm, 16, 13);
+  const pinkyDown  = !fingerExtended(lm, 20, 17);
+  return indexUp && middleDown && ringDown && pinkyDown;
+}
+
+// ── Drawing state ─────────────────────────────────────────────────
+let isDrawing   = false;
+let smoothBuf   = [];
+const SMOOTH    = 6;
+
+function smoothedTip(raw) {
+  smoothBuf.push(raw);
+  if (smoothBuf.length > SMOOTH) smoothBuf.shift();
+  let ax=0, ay=0;
+  for (const p of smoothBuf){ ax+=p.x; ay+=p.y; }
+  return { x: ax/smoothBuf.length, y: ay/smoothBuf.length };
+}
+
+function lmScreen(lm, idx) {
+  return {
+    x: (1 - lm[idx].x) * drawC.width,
+    y:      lm[idx].y  * drawC.height,
+  };
+}
+
+function processHand(lm) {
+  const pointing = isIndexPointing(lm);
+  const wasDrawing = isDrawing;
+
+  if (pointing)  isDrawing = true;
+  if (!pointing) isDrawing = false;
+
+  gestureEl.textContent  = pointing ? '☝ DRAWING' : '✋ READY';
+  gestureEl.style.color  = pointing
+    ? 'rgba(255,220,60,.9)' : 'rgba(255,100,30,.45)';
+
+  const rawTip = lmScreen(lm, 8); // index fingertip
+  const tip    = smoothedTip(rawTip);
+
+  // Started drawing
+  if (isDrawing && !wasDrawing) {
+    currentStroke = [{ ...tip }];
+    smoothBuf     = [rawTip];
+  }
+
+  // Continuing to draw
+  if (isDrawing && currentStroke) {
+    const last = currentStroke[currentStroke.length-1];
+    if (Math.hypot(tip.x-last.x, tip.y-last.y) > 3) {
+      currentStroke.push({ ...tip });
+    }
+  }
+
+  // Stopped drawing — launch firecracker
+  if (!isDrawing && wasDrawing && currentStroke && currentStroke.length > 4) {
+    const strokeObj = { pts: currentStroke, burned: 0 };
+    strokes.push(strokeObj);
+    const fc = new Firecracker([...currentStroke]);
+    fc.strokeRef = strokeObj;
+    firecrackers.push(fc);
+    currentStroke = null;
+    smoothBuf     = [];
+  }
+
+  drawHandOverlay(lm, pointing);
+}
+
+// ── Hand overlay ──────────────────────────────────────────────────
+const CONN = [
+  [0,1],[1,2],[2,3],[3,4],
+  [0,5],[5,6],[6,7],[7,8],
+  [5,9],[9,10],[10,11],[11,12],
+  [9,13],[13,14],[14,15],[15,16],
+  [13,17],[17,18],[18,19],[19,20],[0,17]
+];
+
+function drawHandOverlay(lm, pointing) {
+  hCtx.clearRect(0,0,handC.width,handC.height);
+  const W=handC.width, H=handC.height;
+
+  hCtx.strokeStyle = pointing
+    ? 'rgba(255,200,50,0.18)' : 'rgba(255,80,0,0.10)';
+  hCtx.lineWidth   = 1;
+  for (const [a,b] of CONN) {
+    hCtx.beginPath();
+    hCtx.moveTo((1-lm[a].x)*W, lm[a].y*H);
+    hCtx.lineTo((1-lm[b].x)*W, lm[b].y*H);
+    hCtx.stroke();
+  }
+
+  // Index tip highlight
+  const ix = (1-lm[8].x)*W, iy = lm[8].y*H;
+  hCtx.beginPath();
+  hCtx.arc(ix, iy, pointing?11:5, 0, Math.PI*2);
+  hCtx.fillStyle   = pointing
+    ? 'rgba(255,230,80,1)' : 'rgba(255,255,255,0.25)';
+  hCtx.shadowBlur  = pointing ? 30 : 6;
+  hCtx.shadowColor = pointing ? '#ffcc00' : '#fff';
+  hCtx.fill();
+  hCtx.shadowBlur  = 0;
+
+  // Small dot at all other tips when not pointing
+  if (!pointing) {
+    for (const idx of [4,12,16,20]) {
+      hCtx.beginPath();
+      hCtx.arc((1-lm[idx].x)*W, lm[idx].y*H, 3, 0, Math.PI*2);
+      hCtx.fillStyle = 'rgba(255,80,0,0.3)';
+      hCtx.fill();
+    }
+  }
+}
+
+// ── MediaPipe ─────────────────────────────────────────────────────
+let handLandmarker = null;
+
+async function init() {
+  statusEl.textContent = 'LOADING MODEL...';
+  const vision = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.12/wasm"
+  );
+  handLandmarker = await HandLandmarker.createFromOptions(vision, {
+    baseOptions: {
+      modelAssetPath:"https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+      delegate:"GPU",
+    },
+    runningMode:"VIDEO",
+    numHands:1,
+  });
+
+  statusEl.textContent = 'STARTING CAMERA...';
+  const stream = await navigator.mediaDevices.getUserMedia({
+    video:{ facingMode:'user', width:{ideal:1280}, height:{ideal:720} }
+  });
+  video.srcObject = stream;
+  await new Promise(r => video.addEventListener('loadedmetadata', r, {once:true}));
+  video.play();
+
+  statusEl.textContent = '☝ INDEX UP TO DRAW';
+  setTimeout(() => { statusEl.style.opacity = '0'; }, 4000);
+  detectLoop();
+}
+
+let lastVT = -1;
+function detectLoop() {
+  requestAnimationFrame(detectLoop);
+  if (!handLandmarker || video.readyState < 2) return;
+  if (video.currentTime === lastVT) return;
+  lastVT = video.currentTime;
+
+  const res = handLandmarker.detectForVideo(video, performance.now());
+
+  if (!res.landmarks?.length) {
+    hCtx.clearRect(0,0,handC.width,handC.height);
+    gestureEl.textContent = '— NO HAND';
+    gestureEl.style.color = 'rgba(255,80,0,.2)';
+    if (isDrawing && currentStroke && currentStroke.length > 4) {
+      const strokeObj = { pts: currentStroke, burned: 0 };
+      strokes.push(strokeObj);
+      const fc = new Firecracker([...currentStroke]);
+      fc.strokeRef = strokeObj;
+      firecrackers.push(fc);
+    }
+    isDrawing     = false;
+    currentStroke = null;
+    smoothBuf     = [];
+    return;
+  }
+
+  processHand(res.landmarks[0]);
+}
+
+init().catch(e => {
+  statusEl.textContent = 'ERROR: '+e.message;
+  statusEl.style.opacity = '1';
+  console.error(e);
+});
+</script>
+</body>
+</html>
